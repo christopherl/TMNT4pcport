@@ -9,8 +9,9 @@
 //           Tab (hold) = fast forward, Backspace (hold) = rewind, F12 = recompiled/interpreted CPU
 // Gamepads: the first controller is player 1, the second player 2 (swappable in Controls).
 //           Guide or Back+Start = menu, left trigger (hold) = rewind.
-// Online play: menu "Online play", or on the command line --host [--port N], --join ADDRESS[:PORT],
-//           --delay N (input delay in frames). See netplay.h.
+// Online play: menu "Online play", or on the command line --host-code / --code K7QX (through the code
+//           server set as online_server= in tmnt.ini, or --server HOST:PORT), --host [--port N],
+//           --join ADDRESS[:PORT], --delay N (input delay in frames). See netplay.h.
 // Settings are saved to tmnt.ini next to the program.
 #include <SDL.h>
 #include <stdio.h>
@@ -85,14 +86,22 @@ static void bindings_default(int p) {
 }
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static char g_net_server[256];   // online play code server, "host:port" (empty: join by IP address only)
 static void cfg_load(void) {
   bindings_default(0); bindings_default(1);
   cfg.net_port = NP_PORT; cfg.net_delay = 2;
   FILE* f = fopen(g_ini_path, "r");
   if (!f) return;
-  char k[64]; int v;
-  while (fscanf(f, " %63[^=]=%d", k, &v) == 2) {
-    if (!strcmp(k, "aspect")) cfg.aspect = clampi(v, 0, ASPECT_COUNT - 1);
+  char line[512];
+  while (fgets(line, sizeof line, f)) {
+    char* eq = strchr(line, '=');
+    if (!eq) continue;
+    *eq = 0;
+    char k[64]; snprintf(k, sizeof k, "%s", line);
+    char* sv = eq + 1; sv[strcspn(sv, "\r\n")] = 0;
+    int v = atoi(sv);
+    if (!strcmp(k, "online_server")) snprintf(g_net_server, sizeof g_net_server, "%s", sv);
+    else if (!strcmp(k, "aspect")) cfg.aspect = clampi(v, 0, ASPECT_COUNT - 1);
     else if (!strcmp(k, "integer_scale")) cfg.integer_scale = !!v;
     else if (!strcmp(k, "fullscreen")) cfg.fullscreen = !!v;
     else if (!strcmp(k, "volume")) cfg.volume = clampi(v, 0, 100);
@@ -139,6 +148,7 @@ static void cfg_save(void) {
           cfg.net_ip[0], cfg.net_ip[1], cfg.net_ip[2], cfg.net_ip[3], cfg.net_port, cfg.net_delay);
   for (int i = 0; i < 12; i++) fprintf(f, "key_%d=%d\npad_%d=%d\n", i, (int)g_keymap[0][i], i, g_padmap[0][i]);
   for (int i = 0; i < 12; i++) fprintf(f, "p2key_%d=%d\np2pad_%d=%d\n", i, (int)g_keymap[1][i], i, g_padmap[1][i]);
+  if (g_net_server[0]) fprintf(f, "online_server=%s\n", g_net_server);   // last: older versions stop reading at a text value
   fclose(f);
 }
 
@@ -383,6 +393,16 @@ static NetSock* g_sock;
 static NetAddr g_peer;
 static bool g_peer_known;
 static NpStatus g_np_last = NP_ENDED;
+// Through the code server (tools/relay/tmnt_relay.py): the host gets a short code, the other player
+// enters it, and the server passes the packets between the two. No router setup on either side.
+enum { RELAY_OFF, RELAY_HOSTING, RELAY_JOINING };
+static int g_relay;
+static char g_code[5];                 // host: the code the server gave us
+static char g_code_entry[5] = "AAAA";  // the code typed in to join
+static int g_code_edit = -1;           // character being edited, or -1
+static const char k_code_chars[] = "ACDEFHJKMNPRTWXY3479";   // same as the server's
+static double g_relay_sent, g_relay_start;
+static bool g_relay_paired;
 static uint32_t g_rom_id;   // checksum of the ROM: both sides must have the same
 static double now_s(void) { return (double)SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency(); }
 // the session drives the game: frozen while connecting, then online (the host waiting alone plays normally)
@@ -394,7 +414,23 @@ static uint32_t net_cb_crc(void* c) {
   for (int i = 0; i < (int)sizeof g_snes->ram; i++) h = (h ^ g_snes->ram[i]) * 16777619u;
   return h;
 }
-static void net_cb_send(void* c, const uint8_t* d, int n) { (void)c; if (g_sock && g_peer_known) net_send(g_sock, &g_peer, d, n); }
+static void net_cb_send(void* c, const uint8_t* d, int n) {
+  (void)c;
+  if (!g_sock || !g_peer_known) return;
+  if (!g_relay) { net_send(g_sock, &g_peer, d, n); return; }
+  uint8_t b[1500];
+  if (n > (int)sizeof b - 1) return;
+  b[0] = 'R'; memcpy(b + 1, d, n);
+  net_send(g_sock, &g_peer, b, n + 1);
+}
+static void relay_send(const char* type, const char* code) {   // H / J requests carry the magic and version
+  uint8_t b[16]; int n = 0;
+  b[n++] = (uint8_t)type[0];
+  if (type[0] == 'H' || type[0] == 'J') { memcpy(b + n, "TMNR", 4); n += 4; b[n++] = 1; }
+  if (code) { memcpy(b + n, code, 4); n += 4; }
+  net_send(g_sock, &g_peer, b, n);
+  g_relay_sent = now_s();
+}
 static int wide_extra(void);
 static void net_cb_advance(void* c, int32_t f, uint16_t p1, uint16_t p2, bool render) {
   (void)c; (void)f;
@@ -420,6 +456,8 @@ static void net_stop(void) {
     np_destroy(g_np); g_np = NULL;
     crashlog_event("online play ended");
   }
+  if (g_relay && g_sock) relay_send("Q", NULL);
+  g_relay = RELAY_OFF; g_code[0] = 0; g_relay_paired = false;
   net_close(g_sock); g_sock = NULL;
   g_peer_known = false; g_np_last = NP_ENDED;
   msu_enable(cfg.msu);
@@ -435,6 +473,29 @@ static void net_host(void) {
   ui_toast_text("WAITING FOR PLAYER 2", d);
   crashlog_event("hosting on port %d", cfg.net_port);
 }
+// through the code server: host (code NULL) or join with a code
+static void net_relay_start(const char* code) {
+  net_stop();
+  NetAddr a;
+  if (!g_net_server[0] || !net_resolve(g_net_server, 7846, &a)) { ui_toast_text("NO CODE SERVER", "CHECK ONLINE_SERVER IN TMNT.INI."); return; }
+  g_sock = net_open(0);
+  if (!g_sock) { ui_toast_text("CAN'T GO ONLINE", "NO NETWORK."); return; }
+  g_peer = a; g_peer_known = true;
+  g_relay_start = now_s(); g_relay_sent = -10;
+  if (code) {
+    g_relay = RELAY_JOINING; snprintf(g_code_entry, sizeof g_code_entry, "%s", code);
+    g_np = np_create(false, net_callbacks(), g_rom_id, NULL, cfg.net_delay);
+    g_np_last = NP_CONNECTING;
+    crashlog_event("joining with a code");
+  } else {
+    g_relay = RELAY_HOSTING;
+    NpSettings st = {(uint8_t)cfg.no_slowdown, (uint8_t)cfg.x_lives, (uint8_t)cfg.x_health, (uint8_t)cfg.x_stage, (uint8_t)cfg.unlocked};
+    g_np = np_create(true, net_callbacks(), g_rom_id, &st, cfg.net_delay);
+    g_np_last = NP_WAITING;
+    ui_toast_text("GETTING A CODE...", NULL);
+    crashlog_event("hosting with a code");
+  }
+}
 static void net_join(const char* address) {
   net_stop();
   NetAddr a;
@@ -449,7 +510,30 @@ static void net_join(const char* address) {
 static void net_poll(void) {
   if (!g_np) return;
   uint8_t b[1500]; NetAddr from; int n; double t = now_s();
-  while ((n = net_recv(g_sock, b, sizeof b, &from)) > 0) {
+  if (g_relay == RELAY_HOSTING && !g_code[0]) {
+    if (t - g_relay_start > 10) { net_stop(); ui_toast_text("CAN'T GO ONLINE", "NO ANSWER FROM THE CODE SERVER."); return; }
+    if (t - g_relay_sent > 1) relay_send("H", NULL);
+  } else if (g_relay == RELAY_HOSTING && !g_relay_paired && t - g_relay_sent > 5) relay_send("K", NULL);
+  else if (g_relay == RELAY_JOINING && !g_relay_paired && t - g_relay_sent > 1) relay_send("J", g_code_entry);
+  while (g_relay && g_sock && (n = net_recv(g_sock, b, sizeof b, &from)) > 0) {
+    if (from.ip != g_peer.ip || from.port != g_peer.port) continue;
+    if (b[0] == 'R') np_receive(g_np, b + 1, n - 1, t);
+    else if (b[0] == 'C' && n >= 5 && !g_code[0]) {
+      memcpy(g_code, b + 1, 4); g_code[4] = 0;
+      char d[48]; snprintf(d, sizeof d, "TELL PLAYER 2 THE CODE %s.", g_code);
+      ui_toast_text("WAITING FOR PLAYER 2", d);
+      printf("online code %s\n", g_code); fflush(stdout);
+    } else if (b[0] == 'P') g_relay_paired = true;
+    else if (b[0] == 'E') {
+      char m[64]; snprintf(m, sizeof m, "%.*s.", n - 1 < 60 ? n - 1 : 60, (const char*)b + 1);
+      bool joining = g_relay == RELAY_JOINING && np_status(g_np) == NP_CONNECTING;
+      g_relay = RELAY_OFF;   // the server dropped us: nothing to tell it
+      net_stop();
+      ui_toast_text(joining ? "CAN'T JOIN" : "ONLINE PLAY ENDED", m);
+      return;
+    }
+  }
+  while (!g_relay && (n = net_recv(g_sock, b, sizeof b, &from)) > 0) {
     if (!g_peer_known) {   // host: the first player to ask is the one we play with
       if (!np_is_join_request(b, n)) continue;
       g_peer = from; g_peer_known = true;
@@ -488,13 +572,15 @@ enum {
   M_X_STAGE, M_X_LIVES, M_X_HEALTH,
   M_SWAP, M_DEFAULTS,
   M_ONLINE, M_NET_HOST, M_NET_ADDR, M_NET_JOIN, M_NET_DELAY, M_NET_STATUS, M_NET_MYIP, M_NET_LEAVE,
+  M_NET_HOSTCODE, M_NET_CODE, M_NET_JOINCODE, M_NET_SHOWCODE,
   M_BIND0 /* .. M_BIND0 + 11 */, M_COUNT = M_BIND0 + 12
 };
 enum { PG_MAIN, PG_OPTIONS, PG_VIDEO, PG_AUDIO, PG_GAME, PG_EXTRAS, PG_P1, PG_P2, PG_ACH, PG_STATS, PG_NET, NPAGES };
 static const char* k_page_titles[NPAGES] = {"PAUSE", "PORT SETTINGS", "VIDEO", "AUDIO", "GAMEPLAY", "EXTRAS",
                                             "PLAYER 1 CONTROLS", "PLAYER 2 CONTROLS", "ACHIEVEMENTS", "STATISTICS", "ONLINE PLAY"};
 static const int k_pg_main[] = {M_RESUME, M_RESTART, M_CONTINUE, M_ONLINE, M_OPTIONS, M_ACH, M_STATS, M_SAVE, M_LOAD, M_RESET, M_QUIT, -1};
-static const int k_pg_net[] = {M_NET_STATUS, M_NET_MYIP, M_NET_LEAVE, M_NET_HOST, M_NET_ADDR, M_NET_JOIN, M_NET_DELAY, -1};
+static const int k_pg_net[] = {M_NET_STATUS, M_NET_SHOWCODE, M_NET_MYIP, M_NET_LEAVE,
+                               M_NET_HOSTCODE, M_NET_CODE, M_NET_JOINCODE, M_NET_HOST, M_NET_ADDR, M_NET_JOIN, M_NET_DELAY, -1};
 static const int k_pg_options[] = {M_PG_VIDEO, M_PG_AUDIO, M_PG_GAME, M_PG_P1, M_PG_P2, M_PG_EXTRAS, M_REPORT, -1};
 static const int k_pg_video[] = {M_WIDE, M_M7, M_ASPECT, M_INTEGER, M_SMOOTH, M_CRT, M_COLOR, M_NOLIMIT, M_FULL, -1};
 static const int k_pg_audio[] = {M_VOLUME, M_MUSIC, M_MUSICVOL, M_INTERP, -1};
@@ -518,7 +604,9 @@ static bool item_visible(int id) {
     case M_SAVE: case M_LOAD: case M_RESET: return !net_active();
     case M_NET_HOST: case M_NET_ADDR: case M_NET_JOIN: case M_NET_DELAY: return !g_np;
     case M_NET_STATUS: case M_NET_LEAVE: return g_np != NULL;
-    case M_NET_MYIP: return g_np && np_local_player(g_np) == 0;
+    case M_NET_MYIP: return g_np && np_local_player(g_np) == 0 && !g_relay;
+    case M_NET_HOSTCODE: case M_NET_CODE: case M_NET_JOINCODE: return !g_np && g_net_server[0];
+    case M_NET_SHOWCODE: return g_np && g_relay == RELAY_HOSTING && g_code[0];
     case M_MUSIC: case M_MUSICVOL: return g_msu_songs > 0;
     default: return true;
   }
@@ -595,7 +683,14 @@ static void item_text(int id, char* label, char* value, int n) {
     case M_REWIND: snprintf(label, n, "REWIND"); snprintf(value, n, "%s", k_on_off[cfg.rewind]); break;
     case M_RUMBLE: snprintf(label, n, "RUMBLE"); snprintf(value, n, "%s", k_on_off[cfg.rumble]); break;
     case M_ONLINE: snprintf(label, n, "ONLINE PLAY"); if (g_np) snprintf(value, n, "%s", np_status(g_np) == NP_RUNNING ? "ON" : "..."); break;
-    case M_NET_HOST: snprintf(label, n, "HOST A GAME"); break;
+    case M_NET_HOST: snprintf(label, n, "%s", g_net_server[0] ? "HOST BY IP ADDRESS" : "HOST A GAME"); break;
+    case M_NET_HOSTCODE: snprintf(label, n, "HOST WITH CODE"); break;
+    case M_NET_CODE:
+      snprintf(label, n, "CODE"); snprintf(value, n, "%s", g_code_entry);
+      if (g_code_edit >= 0 && (g_ui_tick / 8) & 1) value[g_code_edit] = ' ';
+      break;
+    case M_NET_JOINCODE: snprintf(label, n, "JOIN WITH CODE"); break;
+    case M_NET_SHOWCODE: snprintf(label, n, "YOUR CODE"); snprintf(value, n, "%s", g_code); break;
     case M_NET_ADDR: {
       snprintf(label, n, "ADDRESS");
       snprintf(value, n, "%03d.%03d.%03d.%03d", cfg.net_ip[0], cfg.net_ip[1], cfg.net_ip[2], cfg.net_ip[3]);
@@ -639,7 +734,7 @@ static int g_ach_sel;
 static void open_menu(bool open) {
   if (open == g_menu) return;
   g_menu = open;
-  g_page = PG_MAIN; g_sel = 0; g_scroll = 0; g_bind_wait = 0; g_addr_edit = -1;
+  g_page = PG_MAIN; g_sel = 0; g_scroll = 0; g_bind_wait = 0; g_addr_edit = -1; g_code_edit = -1;
   release_all();
   if (!open) cfg_save();
 }
@@ -653,6 +748,7 @@ static int parent_page(int pg) {
 static void menu_back(void) {
   if (g_bind_wait) { g_bind_wait = 0; return; }
   if (g_addr_edit >= 0) { g_addr_edit = -1; cfg_save(); return; }
+  if (g_code_edit >= 0) { g_code_edit = -1; return; }
   if (g_page == PG_MAIN) { open_menu(false); return; }
   int from = g_page;
   go_page(parent_page(g_page));
@@ -706,6 +802,9 @@ static void menu_change(int id, int dir, bool activate) {
     case M_SWAP: cfg.pad_swap ^= 1; break;
     case M_ONLINE: if (activate) go_page(PG_NET); break;
     case M_NET_HOST: if (activate) { net_host(); open_menu(false); } break;
+    case M_NET_HOSTCODE: if (activate) { net_relay_start(NULL); open_menu(false); } break;
+    case M_NET_CODE: if (activate) g_code_edit = 0; break;
+    case M_NET_JOINCODE: if (activate) { net_relay_start(g_code_entry); open_menu(false); } break;
     case M_NET_ADDR: if (activate) g_addr_edit = 0; break;
     case M_NET_JOIN: if (activate) {
       char a[32]; snprintf(a, sizeof a, "%d.%d.%d.%d", cfg.net_ip[0], cfg.net_ip[1], cfg.net_ip[2], cfg.net_ip[3]);
@@ -731,8 +830,20 @@ static void addr_edit_key(int dy, int dx, bool enter) {
     cfg.net_ip[o] = clampi(v, 0, 255);
   }
 }
+// the join code: left/right picks a character, up/down changes it
+static void code_edit_key(int dy, int dx, bool enter) {
+  if (enter) { g_code_edit = -1; return; }
+  if (dx) g_code_edit = (g_code_edit + dx + 4) % 4;
+  if (dy) {
+    int nc = (int)strlen(k_code_chars);
+    const char* at = strchr(k_code_chars, g_code_entry[g_code_edit]);
+    int i = at ? (int)(at - k_code_chars) : 0;
+    g_code_entry[g_code_edit] = k_code_chars[(i - dy + nc) % nc];
+  }
+}
 static void menu_key(int dy, int dx, bool enter) {
   if (g_addr_edit >= 0) { addr_edit_key(dy, dx, enter); return; }
+  if (g_code_edit >= 0) { code_edit_key(dy, dx, enter); return; }
   if (g_page == PG_ACH) { g_ach_sel = clampi(g_ach_sel + dy, 0, ach_total() - 1); return; }
   if (g_page == PG_STATS) return;
   int items[32], n = page_items(g_page, items);
@@ -1062,12 +1173,15 @@ int main(int argc, char** argv) {
   snprintf(g_cont_path, sizeof g_cont_path, "%stmnt_continue.state", g_base);
   cfg_load();
   // online play from the command line (e.g. Steam launch options): --host, --join ADDR[:PORT], --port N, --delay N
-  const char* arg_join = NULL; bool arg_host = false;
+  const char* arg_join = NULL; const char* arg_code = NULL; bool arg_host = false, arg_host_code = false;
   {
     int k = 1;
     for (int i = 1; i < argc; i++) {
       if (!strcmp(argv[i], "--host")) arg_host = true;
       else if (!strcmp(argv[i], "--join") && i + 1 < argc) arg_join = argv[++i];
+      else if (!strcmp(argv[i], "--host-code")) arg_host_code = true;
+      else if (!strcmp(argv[i], "--code") && i + 1 < argc) arg_code = argv[++i];
+      else if (!strcmp(argv[i], "--server") && i + 1 < argc) snprintf(g_net_server, sizeof g_net_server, "%s", argv[++i]);
       else if (!strcmp(argv[i], "--port") && i + 1 < argc) cfg.net_port = clampi(atoi(argv[++i]), 1, 65535);
       else if (!strcmp(argv[i], "--delay") && i + 1 < argc) cfg.net_delay = clampi(atoi(argv[++i]), 0, 6);
       else argv[k++] = argv[i];
@@ -1123,6 +1237,8 @@ int main(int argc, char** argv) {
 
   if (arg_host) net_host();
   else if (arg_join) net_join(arg_join);
+  else if (arg_host_code) net_relay_start(NULL);
+  else if (arg_code) { char c[5]; snprintf(c, sizeof c, "%s", arg_code); for (char* q = c; *q; q++) if (*q >= 'a' && *q <= 'z') *q -= 32; net_relay_start(c); }
 
   static uint32_t frame[224][256 + 2 * PPU_WIDE_MAX];
   bool fast = false;
