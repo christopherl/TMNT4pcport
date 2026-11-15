@@ -64,7 +64,7 @@ Settings are saved in `tmnt.ini` next to the program. Save states, best times, s
 
 Two players on two computers, each with the program and their own copy of the ROM (the same USA version). Only the controller input of each frame goes over the network; both computers run the same game, so it plays exactly as it does on one machine.
 
-**With a code** (needs a code server, see [`tools/relay`](tools/relay/README.md); one of you can run it on a NAS or any always-on machine): the host picks *Menu → Online play → Host with code* and tells the other player the four-character code shown; they enter it under *Code* (left/right picks a character, up/down changes it) and pick *Join with code*. Nobody needs to set up their router except for the server.
+**With a code** (needs a code server, see [`tools/relay`](tools/relay/README.md); one of you can run it on a NAS or any always-on machine): the host picks *Menu → Online play → Host with code* and tells the other player the four-character code shown; they enter it under *Code* (type it on the keyboard, paste it with Ctrl+V, or pick each character with left/right and up/down) and pick *Join with code*. Nobody needs to set up their router except for the server.
 
 **By IP address** (no server):
 

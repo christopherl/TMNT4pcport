@@ -483,7 +483,8 @@ static void net_relay_start(const char* code) {
   g_peer = a; g_peer_known = true;
   g_relay_start = now_s(); g_relay_sent = -10;
   if (code) {
-    g_relay = RELAY_JOINING; snprintf(g_code_entry, sizeof g_code_entry, "%s", code);
+    g_relay = RELAY_JOINING;
+    if (code != g_code_entry) { memcpy(g_code_entry, code, 4); g_code_entry[4] = 0; }   // (the menu passes g_code_entry itself)
     g_np = np_create(false, net_callbacks(), g_rom_id, NULL, cfg.net_delay);
     g_np_last = NP_CONNECTING;
     crashlog_event("joining with a code");
@@ -829,6 +830,35 @@ static void addr_edit_key(int dy, int dx, bool enter) {
     v = v - (v / pw % 10) * pw + digit * pw;
     cfg.net_ip[o] = clampi(v, 0, 255);
   }
+}
+// the join code can also be typed (or pasted with Ctrl+V) on the keyboard, including Steam's
+// on-screen keyboard; true if the key was used for that
+static void code_jump_to_join(void) {
+  g_code_edit = -1;
+  int items[32], n = page_items(g_page, items);
+  for (int i = 0; i < n; i++) if (items[i] == M_NET_JOINCODE) g_sel = i;
+}
+static bool code_type_key(SDL_Keycode k, Uint16 mod) {
+  int items[32], n = page_items(g_page, items);
+  bool on_code = g_page == PG_NET && n && g_sel < n && items[g_sel] == M_NET_CODE;
+  if (!on_code && g_code_edit < 0) return false;
+  if (k == SDLK_v && (mod & KMOD_CTRL)) {   // paste: the first four code characters in the clipboard
+    char* t = SDL_GetClipboardText(); int got = 0; char c4[5] = {0};
+    for (char* q = t; q && *q && got < 4; q++) {
+      char c = *q >= 'a' && *q <= 'z' ? *q - 32 : *q;
+      if (c && strchr(k_code_chars, c)) c4[got++] = c;
+    }
+    SDL_free(t);
+    if (got == 4) { memcpy(g_code_entry, c4, 5); code_jump_to_join(); }
+    return true;
+  }
+  if (g_code_edit >= 0 && k == SDLK_BACKSPACE) { if (g_code_edit > 0) g_code_edit--; return true; }
+  char c = k >= SDLK_a && k <= SDLK_z ? (char)(k - SDLK_a + 'A') : k >= SDLK_0 && k <= SDLK_9 ? (char)k : 0;
+  if (!c || !strchr(k_code_chars, c)) return false;
+  if (g_code_edit < 0) g_code_edit = 0;   // typing on the Code row starts at its first character
+  g_code_entry[g_code_edit++] = c;
+  if (g_code_edit >= 4) code_jump_to_join();   // all four: on to "Join with code"
+  return true;
 }
 // the join code: left/right picks a character, up/down changes it
 static void code_edit_key(int dy, int dx, bool enter) {
@@ -1292,6 +1322,7 @@ int main(int argc, char** argv) {
           if (down && k == SDLK_ESCAPE && !ev.key.repeat) { if (g_menu) menu_back(); else open_menu(true); break; }
           if (g_menu) {
             if (!down) break;
+            if (code_type_key(k, ev.key.keysym.mod)) break;
             if (k == SDLK_UP) menu_key(-1, 0, false);
             else if (k == SDLK_DOWN) menu_key(1, 0, false);
             else if (k == SDLK_LEFT) menu_key(0, -1, false);
