@@ -9,6 +9,8 @@
 //           Tab (hold) = fast forward, Backspace (hold) = rewind, F12 = recompiled/interpreted CPU
 // Gamepads: the first controller is player 1, the second player 2 (swappable in Controls).
 //           Guide or Back+Start = menu, left trigger (hold) = rewind.
+// Online play: menu "Online play", or on the command line --host [--port N], --join ADDRESS[:PORT],
+//           --delay N (input delay in frames). See netplay.h.
 // Settings are saved to tmnt.ini next to the program.
 #include <SDL.h>
 #include <stdio.h>
@@ -34,6 +36,8 @@
 #include "steam.h"
 #include "crashlog.h"
 #include "widescreen.h"
+#include "netplay.h"
+#include "net_udp.h"
 
 #define SAMPLE_RATE 48000
 
@@ -59,6 +63,7 @@ static struct {
   int x_stage, x_lives, x_health;     // extras: start scene (0 = off, 1-10), infinite lives, infinite health
   int pad_swap;                       // second controller is player 1
   int m7;                             // Mode 7 detail: 0 original, 1 = 2x, 2 = 4x (intro, title, time warps)
+  int net_ip[4], net_port, net_delay; // online play: address to join, UDP port, input delay (frames)
 } cfg = {ASPECT_4_3, 0, 0, 80, 0,  WIDE_OFF, 0, 0, 0, 0,  0, 0, 1, 1, 1,  0, 100,  0, 0, 0, 0, 0, 0};
 
 // Remappable bindings, per player: one key and one gamepad button for each SNES button (LakeSnes
@@ -82,6 +87,7 @@ static void bindings_default(int p) {
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 static void cfg_load(void) {
   bindings_default(0); bindings_default(1);
+  cfg.net_port = NP_PORT; cfg.net_delay = 2;
   FILE* f = fopen(g_ini_path, "r");
   if (!f) return;
   char k[64]; int v;
@@ -109,6 +115,9 @@ static void cfg_load(void) {
     else if (!strcmp(k, "extra_infinite_health")) cfg.x_health = !!v;
     else if (!strcmp(k, "pad_swap")) cfg.pad_swap = !!v;
     else if (!strcmp(k, "mode7_detail")) cfg.m7 = clampi(v, 0, 2);
+    else if (!strncmp(k, "online_ip", 9) && k[9] >= '1' && k[9] <= '4' && !k[10]) cfg.net_ip[k[9] - '1'] = clampi(v, 0, 255);
+    else if (!strcmp(k, "online_port")) cfg.net_port = clampi(v, 1, 65535);
+    else if (!strcmp(k, "online_input_delay")) cfg.net_delay = clampi(v, 0, 6);
     else if (!strncmp(k, "key_", 4) && atoi(k + 4) >= 0 && atoi(k + 4) < 12) g_keymap[0][atoi(k + 4)] = v;
     else if (!strncmp(k, "pad_", 4) && k[4] >= '0' && k[4] <= '9' && atoi(k + 4) < 12) g_padmap[0][atoi(k + 4)] = v;
     else if (!strncmp(k, "p2key_", 6) && atoi(k + 6) >= 0 && atoi(k + 6) < 12) g_keymap[1][atoi(k + 6)] = v;
@@ -126,6 +135,8 @@ static void cfg_save(void) {
   fprintf(f, "orchestral_music=%d\nmusic_volume=%d\nextras_unlocked=%d\nextra_start_scene=%d\nextra_infinite_lives=%d\nextra_infinite_health=%d\npad_swap=%d\n",
           cfg.msu, cfg.music_vol, cfg.unlocked, cfg.x_stage, cfg.x_lives, cfg.x_health, cfg.pad_swap);
   fprintf(f, "mode7_detail=%d\n", cfg.m7);
+  fprintf(f, "online_ip1=%d\nonline_ip2=%d\nonline_ip3=%d\nonline_ip4=%d\nonline_port=%d\nonline_input_delay=%d\n",
+          cfg.net_ip[0], cfg.net_ip[1], cfg.net_ip[2], cfg.net_ip[3], cfg.net_port, cfg.net_delay);
   for (int i = 0; i < 12; i++) fprintf(f, "key_%d=%d\npad_%d=%d\n", i, (int)g_keymap[0][i], i, g_padmap[0][i]);
   for (int i = 0; i < 12; i++) fprintf(f, "p2key_%d=%d\np2pad_%d=%d\n", i, (int)g_keymap[1][i], i, g_padmap[1][i]);
   fclose(f);
@@ -347,17 +358,124 @@ static void rumble_tick(void) {
 }
 
 // ---------------------------------------------------------------- extras applied to the game
-static void extras_apply(void) {
+static void extras_apply_with(int unlocked, int x_stage, int x_lives, int x_health) {
   uint8_t* ram = g_snes->ram;
-  if (!cfg.unlocked) return;
+  if (!unlocked) return;
   bool any = false;
   // start scene: only on the select screen of a new game (scene 1 chosen by the game; Versus uses scene index 10)
-  if (cfg.x_stage > 1 && game_at_turtle_select(ram) && (game_stage(ram) == 0 || game_stage(ram) == cfg.x_stage - 1)) {
-    game_set_start_stage(ram, cfg.x_stage - 1); any = true;
+  if (x_stage > 1 && game_at_turtle_select(ram) && (game_stage(ram) == 0 || game_stage(ram) == x_stage - 1)) {
+    game_set_start_stage(ram, x_stage - 1); any = true;
   }
-  if (cfg.x_lives && game_in_play(ram)) for (int p = 0; p < 2; p++) if (game_player_active(ram, p)) { game_refill_lives(ram, p); any = true; }
-  if (cfg.x_health && game_in_play(ram)) for (int p = 0; p < 2; p++) if (game_player_active(ram, p)) { game_refill_hp(ram, p); any = true; }
+  if (x_lives && game_in_play(ram)) for (int p = 0; p < 2; p++) if (game_player_active(ram, p)) { game_refill_lives(ram, p); any = true; }
+  if (x_health && game_in_play(ram)) for (int p = 0; p < 2; p++) if (game_player_active(ram, p)) { game_refill_hp(ram, p); any = true; }
   if (any && !g_assisted) { g_assisted = true; crashlog_event("extras in use"); }
+}
+static void extras_apply(void) { extras_apply_with(cfg.unlocked, cfg.x_stage, cfg.x_lives, cfg.x_health); }
+
+// ---------------------------------------------------------------- online play (netplay.c does the work)
+// The host is player 1, whoever joins is player 2; each side plays with its player-1 controls. While
+// the host waits, it keeps playing on its own; when someone joins, the game continues from there.
+static void ui_toast_text(const char* t, const char* d);
+static void open_menu(bool open);
+static bool g_menu;
+static Netplay* g_np;
+static NetSock* g_sock;
+static NetAddr g_peer;
+static bool g_peer_known;
+static NpStatus g_np_last = NP_ENDED;
+static uint32_t g_rom_id;   // checksum of the ROM: both sides must have the same
+static double now_s(void) { return (double)SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency(); }
+// the session drives the game: frozen while connecting, then online (the host waiting alone plays normally)
+static bool net_active(void) { return g_np && np_status(g_np) != NP_WAITING && np_status(g_np) != NP_ENDED; }
+static int net_cb_save(void* c, uint8_t* b) { (void)c; return snes_saveState(g_snes, b); }
+static void net_cb_load(void* c, const uint8_t* b, int n) { (void)c; snes_loadState(g_snes, (uint8_t*)b, n); ws_state_loaded(); }
+static uint32_t net_cb_crc(void* c) {
+  (void)c; uint32_t h = 2166136261u;
+  for (int i = 0; i < (int)sizeof g_snes->ram; i++) h = (h ^ g_snes->ram[i]) * 16777619u;
+  return h;
+}
+static void net_cb_send(void* c, const uint8_t* d, int n) { (void)c; if (g_sock && g_peer_known) net_send(g_sock, &g_peer, d, n); }
+static int wide_extra(void);
+static void net_cb_advance(void* c, int32_t f, uint16_t p1, uint16_t p2, bool render) {
+  (void)c; (void)f;
+  extern int g_snes_overclock, g_dsp_interp;
+  const NpSettings* st = np_settings(g_np);
+  g_snes->ppu->noSpriteLimit = cfg.nolimit;   // these two only change the picture and sound
+  g_dsp_interp = cfg.interp;
+  g_snes_overclock = st->overclock && game_in_play(g_snes->ram);
+  ws_update(wide_extra());
+  extras_apply_with(st->unlocked, st->x_stage, st->x_lives, st->x_health);
+  for (int i = 0; i < 12; i++) { snes_setButtonState(g_snes, 1, i, (p1 >> i) & 1); snes_setButtonState(g_snes, 2, i, (p2 >> i) & 1); }
+  g_snes->ppu->skipRender = !render;   // replayed frames are never shown
+  runner_frame(g_snes);
+  g_snes->ppu->skipRender = false;
+}
+static NpCallbacks net_callbacks(void) {
+  NpCallbacks cb = {NULL, net_cb_save, net_cb_load, net_cb_advance, net_cb_crc, net_cb_send};
+  return cb;
+}
+static void net_stop(void) {
+  if (g_np) {
+    if (np_status(g_np) != NP_ENDED) np_leave(g_np);
+    np_destroy(g_np); g_np = NULL;
+    crashlog_event("online play ended");
+  }
+  net_close(g_sock); g_sock = NULL;
+  g_peer_known = false; g_np_last = NP_ENDED;
+  msu_enable(cfg.msu);
+}
+static void net_host(void) {
+  net_stop();
+  g_sock = net_open(cfg.net_port);
+  if (!g_sock) { ui_toast_text("CAN'T HOST", "THE PORT IS IN USE."); return; }
+  NpSettings st = {(uint8_t)cfg.no_slowdown, (uint8_t)cfg.x_lives, (uint8_t)cfg.x_health, (uint8_t)cfg.x_stage, (uint8_t)cfg.unlocked};
+  g_np = np_create(true, net_callbacks(), g_rom_id, &st, cfg.net_delay);
+  g_np_last = NP_WAITING;
+  char d[48]; snprintf(d, sizeof d, "YOUR IP: %s", net_local_ip());
+  ui_toast_text("WAITING FOR PLAYER 2", d);
+  crashlog_event("hosting on port %d", cfg.net_port);
+}
+static void net_join(const char* address) {
+  net_stop();
+  NetAddr a;
+  if (!net_resolve(address, cfg.net_port, &a)) { ui_toast_text("CAN'T JOIN", "UNKNOWN ADDRESS."); return; }
+  g_sock = net_open(0);
+  if (!g_sock) { ui_toast_text("CAN'T JOIN", "NO NETWORK."); return; }
+  g_peer = a; g_peer_known = true;
+  g_np = np_create(false, net_callbacks(), g_rom_id, NULL, cfg.net_delay);
+  g_np_last = NP_CONNECTING;
+  crashlog_event("joining %s", address);
+}
+static void net_poll(void) {
+  if (!g_np) return;
+  uint8_t b[1500]; NetAddr from; int n; double t = now_s();
+  while ((n = net_recv(g_sock, b, sizeof b, &from)) > 0) {
+    if (!g_peer_known) {   // host: the first player to ask is the one we play with
+      if (!np_is_join_request(b, n)) continue;
+      g_peer = from; g_peer_known = true;
+    } else if (from.ip != g_peer.ip || from.port != g_peer.port) continue;
+    np_receive(g_np, b, n, t);
+  }
+  NpStatus st = np_status(g_np);
+  if (st == g_np_last) return;
+  if ((st == NP_SYNCING || st == NP_RUNNING) && (g_np_last == NP_WAITING || g_np_last == NP_CONNECTING)) {
+    msu_enable(0);         // the MSU-1 hook changes what goes to the sound CPU: off on both sides
+    release_all();
+    g_assisted = true;     // no achievements or records from online games
+    if (g_menu && st == NP_SYNCING) open_menu(false);
+  }
+  if (st == NP_RUNNING && g_np_last != NP_RUNNING) {
+    char d[48]; snprintf(d, sizeof d, "YOU ARE PLAYER %d.", np_local_player(g_np) + 1);
+    ui_toast_text("ONLINE!", d);
+    crashlog_event("online play started, player %d", np_local_player(g_np) + 1);
+  }
+  if (st == NP_ENDED) {
+    char m[96]; snprintf(m, sizeof m, "%s.", np_message(g_np));
+    net_stop();
+    ui_toast_text("ONLINE PLAY ENDED", m);
+    return;
+  }
+  g_np_last = st;
 }
 
 // ---------------------------------------------------------------- menu
@@ -368,19 +486,23 @@ enum {
   M_VOLUME, M_MUSIC, M_MUSICVOL, M_INTERP,
   M_SLOW, M_TIMER, M_REWIND, M_RUMBLE, M_PAUSEBTN,
   M_X_STAGE, M_X_LIVES, M_X_HEALTH,
-  M_SWAP, M_DEFAULTS, M_BIND0 /* .. M_BIND0 + 11 */, M_COUNT = M_BIND0 + 12
+  M_SWAP, M_DEFAULTS,
+  M_ONLINE, M_NET_HOST, M_NET_ADDR, M_NET_JOIN, M_NET_DELAY, M_NET_STATUS, M_NET_MYIP, M_NET_LEAVE,
+  M_BIND0 /* .. M_BIND0 + 11 */, M_COUNT = M_BIND0 + 12
 };
-enum { PG_MAIN, PG_OPTIONS, PG_VIDEO, PG_AUDIO, PG_GAME, PG_EXTRAS, PG_P1, PG_P2, PG_ACH, PG_STATS, NPAGES };
+enum { PG_MAIN, PG_OPTIONS, PG_VIDEO, PG_AUDIO, PG_GAME, PG_EXTRAS, PG_P1, PG_P2, PG_ACH, PG_STATS, PG_NET, NPAGES };
 static const char* k_page_titles[NPAGES] = {"PAUSE", "PORT SETTINGS", "VIDEO", "AUDIO", "GAMEPLAY", "EXTRAS",
-                                            "PLAYER 1 CONTROLS", "PLAYER 2 CONTROLS", "ACHIEVEMENTS", "STATISTICS"};
-static const int k_pg_main[] = {M_RESUME, M_RESTART, M_CONTINUE, M_OPTIONS, M_ACH, M_STATS, M_SAVE, M_LOAD, M_RESET, M_QUIT, -1};
+                                            "PLAYER 1 CONTROLS", "PLAYER 2 CONTROLS", "ACHIEVEMENTS", "STATISTICS", "ONLINE PLAY"};
+static const int k_pg_main[] = {M_RESUME, M_RESTART, M_CONTINUE, M_ONLINE, M_OPTIONS, M_ACH, M_STATS, M_SAVE, M_LOAD, M_RESET, M_QUIT, -1};
+static const int k_pg_net[] = {M_NET_STATUS, M_NET_MYIP, M_NET_LEAVE, M_NET_HOST, M_NET_ADDR, M_NET_JOIN, M_NET_DELAY, -1};
 static const int k_pg_options[] = {M_PG_VIDEO, M_PG_AUDIO, M_PG_GAME, M_PG_P1, M_PG_P2, M_PG_EXTRAS, M_REPORT, -1};
 static const int k_pg_video[] = {M_WIDE, M_M7, M_ASPECT, M_INTEGER, M_SMOOTH, M_CRT, M_COLOR, M_NOLIMIT, M_FULL, -1};
 static const int k_pg_audio[] = {M_VOLUME, M_MUSIC, M_MUSICVOL, M_INTERP, -1};
 static const int k_pg_game[] = {M_SLOW, M_TIMER, M_REWIND, M_RUMBLE, M_PAUSEBTN, -1};
 static const int k_pg_extras[] = {M_X_STAGE, M_X_LIVES, M_X_HEALTH, -1};
 static int k_pg_ctrl[16];
-static const int* k_pages[NPAGES] = {k_pg_main, k_pg_options, k_pg_video, k_pg_audio, k_pg_game, k_pg_extras, k_pg_ctrl, k_pg_ctrl, NULL, NULL};
+static const int* k_pages[NPAGES] = {k_pg_main, k_pg_options, k_pg_video, k_pg_audio, k_pg_game, k_pg_extras, k_pg_ctrl, k_pg_ctrl, NULL, NULL, k_pg_net};
+static int g_addr_edit = -1;   // online address being edited: the digit (0-11) under the cursor, or -1
 static bool g_menu;
 static int g_page, g_sel, g_scroll;
 static int g_bind_wait;       // rebinding: 1 = waiting for a key or pad button for row g_sel
@@ -391,8 +513,12 @@ static const char* k_on_off[] = {"OFF", "ON"};
 
 static bool item_visible(int id) {
   switch (id) {
-    case M_RESTART: return restart_available();
-    case M_CONTINUE: return !game_in_play(g_snes->ram) && continue_available();
+    case M_RESTART: return restart_available() && !net_active();
+    case M_CONTINUE: return !game_in_play(g_snes->ram) && continue_available() && !net_active();
+    case M_SAVE: case M_LOAD: case M_RESET: return !net_active();
+    case M_NET_HOST: case M_NET_ADDR: case M_NET_JOIN: case M_NET_DELAY: return !g_np;
+    case M_NET_STATUS: case M_NET_LEAVE: return g_np != NULL;
+    case M_NET_MYIP: return g_np && np_local_player(g_np) == 0;
     case M_MUSIC: case M_MUSICVOL: return g_msu_songs > 0;
     default: return true;
   }
@@ -468,6 +594,30 @@ static void item_text(int id, char* label, char* value, int n) {
     case M_TIMER: snprintf(label, n, "SPEEDRUN TIMER"); snprintf(value, n, "%s", k_on_off[cfg.timer]); break;
     case M_REWIND: snprintf(label, n, "REWIND"); snprintf(value, n, "%s", k_on_off[cfg.rewind]); break;
     case M_RUMBLE: snprintf(label, n, "RUMBLE"); snprintf(value, n, "%s", k_on_off[cfg.rumble]); break;
+    case M_ONLINE: snprintf(label, n, "ONLINE PLAY"); if (g_np) snprintf(value, n, "%s", np_status(g_np) == NP_RUNNING ? "ON" : "..."); break;
+    case M_NET_HOST: snprintf(label, n, "HOST A GAME"); break;
+    case M_NET_ADDR: {
+      snprintf(label, n, "ADDRESS");
+      snprintf(value, n, "%03d.%03d.%03d.%03d", cfg.net_ip[0], cfg.net_ip[1], cfg.net_ip[2], cfg.net_ip[3]);
+      if (g_addr_edit >= 0 && (g_ui_tick / 8) & 1) value[g_addr_edit + g_addr_edit / 3] = ' ';   // blink the digit being changed
+      break;
+    }
+    case M_NET_JOIN: snprintf(label, n, "JOIN THIS ADDRESS"); break;
+    case M_NET_DELAY: snprintf(label, n, "INPUT DELAY"); snprintf(value, n, "%d FRAME%s", cfg.net_delay, cfg.net_delay == 1 ? "" : "S"); break;
+    case M_NET_STATUS: {
+      NpStatus st = g_np ? np_status(g_np) : NP_ENDED;
+      snprintf(label, n, "%s", st == NP_WAITING ? "WAITING FOR PLAYER 2" : st == NP_CONNECTING ? "CONNECTING" :
+               st == NP_SYNCING ? "SENDING THE GAME" : np_local_player(g_np) ? "ONLINE AS PLAYER 2" : "ONLINE AS PLAYER 1");
+      if (st == NP_RUNNING) snprintf(value, n, "%dMS", np_stats(g_np)->ping_ms);
+      break;
+    }
+    case M_NET_MYIP: {
+      snprintf(label, n, "YOUR IP");
+      const char* ip = net_local_ip();
+      if (cfg.net_port != NP_PORT) snprintf(value, n, "%s:%d", ip[0] ? ip : "?", cfg.net_port); else snprintf(value, n, "%s", ip[0] ? ip : "?");
+      break;
+    }
+    case M_NET_LEAVE: snprintf(label, n, "%s", g_np && np_status(g_np) == NP_WAITING ? "STOP HOSTING" : "LEAVE ONLINE GAME"); break;
     case M_PAUSEBTN: snprintf(label, n, "START BUTTON"); snprintf(value, n, "%s", cfg.pause_menu ? "PAUSE MENU" : "GAME PAUSE"); break;
     case M_X_STAGE: snprintf(label, n, "START AT SCENE");
       if (cfg.x_stage) snprintf(value, n, "%d", cfg.x_stage); else snprintf(value, n, "OFF"); break;
@@ -489,7 +639,7 @@ static int g_ach_sel;
 static void open_menu(bool open) {
   if (open == g_menu) return;
   g_menu = open;
-  g_page = PG_MAIN; g_sel = 0; g_scroll = 0; g_bind_wait = 0;
+  g_page = PG_MAIN; g_sel = 0; g_scroll = 0; g_bind_wait = 0; g_addr_edit = -1;
   release_all();
   if (!open) cfg_save();
 }
@@ -502,13 +652,14 @@ static int parent_page(int pg) {
 }
 static void menu_back(void) {
   if (g_bind_wait) { g_bind_wait = 0; return; }
+  if (g_addr_edit >= 0) { g_addr_edit = -1; cfg_save(); return; }
   if (g_page == PG_MAIN) { open_menu(false); return; }
   int from = g_page;
   go_page(parent_page(g_page));
   int items[32], n = page_items(g_page, items);
   int want = from == PG_OPTIONS ? M_OPTIONS : from == PG_ACH ? M_ACH : from == PG_STATS ? M_STATS :
              from == PG_VIDEO ? M_PG_VIDEO : from == PG_AUDIO ? M_PG_AUDIO : from == PG_GAME ? M_PG_GAME :
-             from == PG_P1 ? M_PG_P1 : from == PG_P2 ? M_PG_P2 : M_PG_EXTRAS;
+             from == PG_P1 ? M_PG_P1 : from == PG_P2 ? M_PG_P2 : from == PG_NET ? M_ONLINE : M_PG_EXTRAS;
   for (int i = 0; i < n; i++) if (items[i] == want) g_sel = i;
 }
 static void menu_change(int id, int dir, bool activate) {
@@ -553,13 +704,35 @@ static void menu_change(int id, int dir, bool activate) {
     case M_X_LIVES: cfg.x_lives ^= 1; break;
     case M_X_HEALTH: cfg.x_health ^= 1; break;
     case M_SWAP: cfg.pad_swap ^= 1; break;
+    case M_ONLINE: if (activate) go_page(PG_NET); break;
+    case M_NET_HOST: if (activate) { net_host(); open_menu(false); } break;
+    case M_NET_ADDR: if (activate) g_addr_edit = 0; break;
+    case M_NET_JOIN: if (activate) {
+      char a[32]; snprintf(a, sizeof a, "%d.%d.%d.%d", cfg.net_ip[0], cfg.net_ip[1], cfg.net_ip[2], cfg.net_ip[3]);
+      net_join(a); open_menu(false);
+    } break;
+    case M_NET_DELAY: cfg.net_delay = (cfg.net_delay + d + 7) % 7; break;
+    case M_NET_LEAVE: if (activate) { net_stop(); ui_toast_text("ONLINE PLAY ENDED", NULL); } break;
     case M_DEFAULTS: if (activate) bindings_default(g_page == PG_P2); break;
     default:
       if (id >= M_BIND0 && id < M_BIND0 + 12 && activate) g_bind_wait = 1;
   }
   cfg_save();
 }
+// the online address: 12 digits (4 x 3); left/right picks a digit, up/down changes it
+static void addr_edit_key(int dy, int dx, bool enter) {
+  if (enter) { g_addr_edit = -1; cfg_save(); return; }
+  if (dx) g_addr_edit = (g_addr_edit + dx + 12) % 12;
+  if (dy) {
+    int o = g_addr_edit / 3, pos = 2 - g_addr_edit % 3, pw = pos == 0 ? 1 : pos == 1 ? 10 : 100;
+    int v = cfg.net_ip[o], digit = v / pw % 10;
+    digit = (digit - dy + 10) % 10;   // up = higher digit
+    v = v - (v / pw % 10) * pw + digit * pw;
+    cfg.net_ip[o] = clampi(v, 0, 255);
+  }
+}
 static void menu_key(int dy, int dx, bool enter) {
+  if (g_addr_edit >= 0) { addr_edit_key(dy, dx, enter); return; }
   if (g_page == PG_ACH) { g_ach_sel = clampi(g_ach_sel + dy, 0, ach_total() - 1); return; }
   if (g_page == PG_STATS) return;
   int items[32], n = page_items(g_page, items);
@@ -673,6 +846,12 @@ static void toast_tick(void) {
 }
 static bool draw_overlays(void) {   // pop-up and timer; true if anything was drawn
   bool any = false;
+  if (g_np && !g_menu) {   // online: say so while the game is frozen or the other side has gone quiet
+    NpStatus st = np_status(g_np);
+    const char* t = st == NP_CONNECTING ? "CONNECTING..." : st == NP_SYNCING ? "STARTING ONLINE GAME..." :
+                    np_stalled(g_np) ? "WAITING FOR THE OTHER PLAYER" : NULL;
+    if (t) { ui_toast_box(16, 20, 224, 20, 256); ui_text_a(24, 26, t, UI_GOLD, 256); any = true; }
+  }
   if (cfg.timer && !g_menu) {
     char run[32], st[32]; uint32_t rc, sc;
     if (extras_timer_text(run, sizeof run, st, sizeof st, &rc, &sc)) {
@@ -702,7 +881,8 @@ static const char* settings_summary(void) {
 }
 
 // ---------------------------------------------------------------- automated test driver
-// TMNT_AUTOTEST="w600 k:Return w60 shot:a.ppm q": wN wait frames, k:KEY tap a key, d:/u: key down/up, shot:FILE, q quit.
+// TMNT_AUTOTEST="w600 k:Return w60 shot:a.ppm q": wN wait frames, k:KEY tap a key, d:/u: key down/up, shot:FILE, q quit,
+// netstat prints the online play state.
 static const char* g_at;
 static int g_at_wait;
 static char g_at_shot[256];
@@ -722,6 +902,16 @@ static void autotest_tick(void) {
   if (w[0] == 'w') g_at_wait = atoi(w + 1);
   else if (w[0] == 'q') g_quit = true;
   else if (!strncmp(w, "shot:", 5)) snprintf(g_at_shot, sizeof g_at_shot, "%s", w + 5);
+  else if (!strcmp(w, "netstat")) {   // online play state, for tests
+    if (!g_np) printf("netstat: off\n");
+    else {
+      const NpStats* t = np_stats(g_np);
+      printf("netstat: status %d player %d frame %u confirmed %d ping %d rollbacks %d (max %d) stalls %d desyncs %d resyncs %d crc %08X %s\n",
+             (int)np_status(g_np), np_local_player(g_np) + 1, np_frame(g_np), np_confirmed(g_np), t->ping_ms, t->rollbacks,
+             t->max_depth, t->stalls, t->desyncs, t->resyncs, net_cb_crc(NULL), game_describe(g_snes->ram));
+    }
+    fflush(stdout);
+  }
   else if (w[1] == ':' && (w[0] == 'k' || w[0] == 'd' || w[0] == 'u')) {
     SDL_Keycode k = SDL_GetKeyFromName(w + 2);
     if (w[0] != 'u') at_key(k, true);
@@ -826,6 +1016,35 @@ static void title_credit(void) {
 }
 static void menus_after_vblank(void) { title_credit(); }
 
+static void sticks_to_dpad(void) {   // left stick as d-pad
+  for (int i = 0; i < g_npads && i < 2; i++) {
+    SDL_GameController* gc = SDL_GameControllerFromInstanceID(g_pads[i]);
+    if (!gc) continue;
+    int p = net_active() ? 0 : i ^ cfg.pad_swap;
+    int x = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX), y = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY);
+    static int lx[2], ly[2];
+    int nx = x < -16000 ? -1 : x > 16000 ? 1 : 0, ny = y < -16000 ? -1 : y > 16000 ? 1 : 0;
+    if (nx != lx[i]) { set_btn(p, BTN_LEFT, nx < 0); set_btn(p, BTN_RIGHT, nx > 0); lx[i] = nx; }
+    if (ny != ly[i]) { set_btn(p, BTN_UP, ny < 0); set_btn(p, BTN_DOWN, ny > 0); ly[i] = ny; }
+  }
+}
+
+static void audio_frame(SDL_AudioDeviceID dev, int freq) {
+  if (!dev) return;
+  // the console runs at 60.0988 frames a second: 798.68 samples a frame at 48 kHz
+  static double acc;
+  acc += (double)freq / 60.0988;
+  int n = (int)acc; acc -= n;
+  snes_setSamples(g_snes, g_audio, n);
+  for (int i = 0; i < n * 2; i++) g_audio[i] = (int16_t)(g_audio[i] * cfg.volume / 100);
+  msu_mix(g_audio, n, freq, cfg.volume * cfg.music_vol / 100);
+  // keep about 3-6 frames queued: low latency, and any drift (display vs audio clock) is
+  // absorbed by dropping or skipping a frame's worth only when the queue leaves that range
+  Uint32 q = SDL_GetQueuedAudioSize(dev), fb = (Uint32)n * 4;
+  if (q < fb * 6) SDL_QueueAudio(dev, g_audio, n * 4);
+  if (q < fb * 2) SDL_QueueAudio(dev, g_audio, n * 4);   // running dry: pad with this frame again
+}
+
 int main(int argc, char** argv) {
   SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM, "1");
   SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
@@ -842,7 +1061,22 @@ int main(int argc, char** argv) {
   snprintf(g_state_path, sizeof g_state_path, "%stmnt.state", g_base);
   snprintf(g_cont_path, sizeof g_cont_path, "%stmnt_continue.state", g_base);
   cfg_load();
+  // online play from the command line (e.g. Steam launch options): --host, --join ADDR[:PORT], --port N, --delay N
+  const char* arg_join = NULL; bool arg_host = false;
+  {
+    int k = 1;
+    for (int i = 1; i < argc; i++) {
+      if (!strcmp(argv[i], "--host")) arg_host = true;
+      else if (!strcmp(argv[i], "--join") && i + 1 < argc) arg_join = argv[++i];
+      else if (!strcmp(argv[i], "--port") && i + 1 < argc) cfg.net_port = clampi(atoi(argv[++i]), 1, 65535);
+      else if (!strcmp(argv[i], "--delay") && i + 1 < argc) cfg.net_delay = clampi(atoi(argv[++i]), 0, 6);
+      else argv[k++] = argv[i];
+    }
+    argc = k;
+  }
   if (!find_rom(argc, argv)) return 1;
+  g_rom_id = 2166136261u;
+  for (int i = 0; i < g_rom_len; i++) g_rom_id = (g_rom_id ^ g_rom[i]) * 16777619u;
 
   g_snes = snes_init();
   snes_loadRom(g_snes, g_rom, g_rom_len);
@@ -887,6 +1121,9 @@ int main(int argc, char** argv) {
   if (dev) SDL_PauseAudioDevice(dev, 0);
   for (int i = 0; i < SDL_NumJoysticks(); i++) if (SDL_IsGameController(i)) pad_added(i);
 
+  if (arg_host) net_host();
+  else if (arg_join) net_join(arg_join);
+
   static uint32_t frame[224][256 + 2 * PPU_WIDE_MAX];
   bool fast = false;
   uint64_t freq = SDL_GetPerformanceFrequency(), next = SDL_GetPerformanceCounter();
@@ -919,7 +1156,8 @@ int main(int argc, char** argv) {
             break;
           }
           int b = pad_to_btn(p, bt);
-          if (b == BTN_START && down && p == 0 && cfg.pause_menu && game_in_play(g_snes->ram)) { open_menu(true); break; }
+          if (net_active()) p = 0;   // online, every local controller plays as this side's player
+          if (b == BTN_START && down && p == 0 && cfg.pause_menu && game_in_play(g_snes->ram) && !net_active()) { open_menu(true); break; }
           if (b >= 0) set_btn(p, b, down);
           SDL_GameController* gc = SDL_GameControllerFromInstanceID(ev.cbutton.which);
           if (down && gc && SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_BACK) &&
@@ -947,11 +1185,12 @@ int main(int argc, char** argv) {
             break;
           }
           int p = 0, b = key_to_btn(k, &p);
-          if (b == BTN_START && down && !ev.key.repeat && p == 0 && cfg.pause_menu && game_in_play(g_snes->ram)) { open_menu(true); break; }
+          if (net_active()) p = 0;
+          if (b == BTN_START && down && !ev.key.repeat && p == 0 && cfg.pause_menu && game_in_play(g_snes->ram) && !net_active()) { open_menu(true); break; }
           if (b >= 0 && !ev.key.repeat) set_btn(p, b, down);
           if (k == SDLK_TAB) fast = down;
           if (k == SDLK_BACKSPACE) g_rewinding = down;
-          if (down && !ev.key.repeat) {
+          if (down && !ev.key.repeat && !net_active()) {   // not online: both sides must stay the same
             if (k == SDLK_F5) save_state_file();
             if (k == SDLK_F7) load_state_file();
             if (k == SDLK_F8 && restart_available()) restart_scene();
@@ -963,17 +1202,29 @@ int main(int argc, char** argv) {
         }
       }
     }
-    if (!g_menu) {
-      for (int i = 0; i < g_npads && i < 2; i++) {   // left stick as d-pad
-        SDL_GameController* gc = SDL_GameControllerFromInstanceID(g_pads[i]);
-        if (!gc) continue;
-        int p = i ^ cfg.pad_swap;
-        int x = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTX), y = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_LEFTY);
-        static int lx[2], ly[2];
-        int nx = x < -16000 ? -1 : x > 16000 ? 1 : 0, ny = y < -16000 ? -1 : y > 16000 ? 1 : 0;
-        if (nx != lx[p]) { set_btn(p, BTN_LEFT, nx < 0); set_btn(p, BTN_RIGHT, nx > 0); lx[p] = nx; }
-        if (ny != ly[p]) { set_btn(p, BTN_UP, ny < 0); set_btn(p, BTN_DOWN, ny > 0); ly[p] = ny; }
-      }
+    net_poll();
+    if (net_active()) {
+      // online: netplay.c runs the frame (and replays after a misprediction); the local player's
+      // buttons come from player 1's controls. The menu doesn't pause an online game.
+      if (!g_menu) sticks_to_dpad();
+      uint16_t mine = g_menu ? 0 : g_btn_down[0];
+      g_btn_seen[0] = g_btn_down[0];
+      g_snes->ppu->m7hiresK = cfg.m7 == 2 ? 4 : cfg.m7 == 1 ? 2 : 0;
+      bool m7used = g_snes->ppu->m7frameUsed;
+      g_snes->ppu->m7frameUsed = false;
+      int ran = np_tick(g_np, mine, now_s());
+      after_frame_buttons();
+      if (ran) {
+        rumble_tick();
+        const GameEvents* gev = game_events(g_snes->ram);
+        ach_update(gev, true);
+        extras_frame(gev, true);
+        steam_tick();
+        crashlog_frame();
+        audio_frame(dev, have.freq);
+      } else g_snes->ppu->m7frameUsed = m7used;
+    } else if (!g_menu) {
+      sticks_to_dpad();
       bool rw_held = g_rewinding;
       for (int i = 0; i < g_npads; i++) {
         SDL_GameController* gc = SDL_GameControllerFromInstanceID(g_pads[i]);
@@ -1013,20 +1264,7 @@ int main(int argc, char** argv) {
         steam_tick();
         crashlog_frame();
       }
-      if (dev && !fast) {
-        // the console runs at 60.0988 frames a second: 798.68 samples a frame at 48 kHz
-        static double acc;
-        acc += (double)have.freq / 60.0988;
-        int n = (int)acc; acc -= n;
-        snes_setSamples(g_snes, g_audio, n);
-        for (int i = 0; i < n * 2; i++) g_audio[i] = (int16_t)(g_audio[i] * cfg.volume / 100);
-        msu_mix(g_audio, n, have.freq, cfg.volume * cfg.music_vol / 100);
-        // keep about 3-6 frames queued: low latency, and any drift (display vs audio clock) is
-        // absorbed by dropping or skipping a frame's worth only when the queue leaves that range
-        Uint32 q = SDL_GetQueuedAudioSize(dev), fb = (Uint32)n * 4;
-        if (q < fb * 6) SDL_QueueAudio(dev, g_audio, n * 4);
-        if (q < fb * 2) SDL_QueueAudio(dev, g_audio, n * 4);   // running dry: pad with this frame again
-      }
+      if (!fast) audio_frame(dev, have.freq);
     }
     g_ui_tick++;
     if (!ui_font_ready() && (g_ui_tick & 31) == 0) ui_font_capture(g_snes->ppu->vram, g_snes->ppu->bgLayer[2].tileAdr, g_font_path);
@@ -1109,6 +1347,7 @@ int main(int argc, char** argv) {
     if (now < next) SDL_Delay((Uint32)((next - now) * 1000 / freq));
     else if (now - next > freq / 4) next = now;
   }
+  net_stop();
   cfg_save();
   extras_shutdown();
   steam_shutdown();
